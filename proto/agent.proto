@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+// Shared gRPC contract for the agent-rs platform.
+//
+// Owner: github.com/cosming20/agent-rs-proto
+// Consumers:
+//   - github.com/cosming20/agent-rs         (service implementation, tonic server)
+//   - github.com/cosming20/agent-rs-web     (leptos+axum frontend, tonic client)
+//
+// Versioning rules:
+//   - Fields must only be ADDED; never renumbered, retyped, or removed.
+//   - Reserved numbers: see `reserved` statements in individual messages.
+//   - New RPCs append to the `Agent` service.
+//   - Breaking changes go into `agent.v2.proto` (not in this release).
+
+package agent.v1;
+
+// -----------------------------------------------------------------------------
+// Core value types
+// -----------------------------------------------------------------------------
+
+// User identifier — ASCII `[A-Za-z0-9_-]{1,128}`. Validated server-side by
+// `agent_rs_core::types::UserId::try_new`; malformed inputs return
+// `FAILED_PRECONDITION`.
+message UserRef {
+  string user_id = 1;
+}
+
+// Conversation identifier (UUID v4 string form). Empty string on AskRequest /
+// SessionHistory asks the server to issue a fresh session_id.
+message SessionRef {
+  string user_id    = 1;
+  string session_id = 2;
+}
+
+// Document identifier (UUID v5, derived server-side from
+// `user_id|sha256`). Opaque to clients — treat as a bytestring.
+message DocRef {
+  string user_id     = 1;
+  string document_id = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Documents
+// -----------------------------------------------------------------------------
+
+message Document {
+  string document_id       = 1;
+  string user_id           = 2;
+  string source            = 3;   // original filename
+  string title             = 4;   // Docling-extracted title (may be empty)
+  string ingest_status     = 5;   // 'in_progress' | 'complete' | 'partial_failure' | 'failed' | 'deleting'
+  uint32 n_pages           = 6;
+  uint32 n_chunks          = 7;
+  string minio_object_key  = 8;   // "users/{u}/docs/{d}.{ext}", opaque to clients
+  string started_at        = 9;   // RFC 3339 UTC
+  string completed_at      = 10;  // RFC 3339 UTC, empty when still in progress
+}
+
+message DocumentList {
+  repeated Document documents = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Sessions + chat history
+// -----------------------------------------------------------------------------
+
+message Session {
+  string session_id  = 1;
+  string user_id     = 2;
+  string created_at  = 3;  // RFC 3339
+  string updated_at  = 4;
+  uint32 message_count = 5;
+}
+
+message SessionList {
+  repeated Session sessions = 1;
+}
+
+message ChatMessage {
+  string id         = 1;
+  string session_id = 2;
+  string user_id    = 3;
+  string role       = 4;  // "user" | "assistant" | "system"
+  string content    = 5;
+  string created_at = 6;  // RFC 3339
+}
+
+message MessageList {
+  repeated ChatMessage messages = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Ask (query) — server-streaming so the client can render progress.
+// -----------------------------------------------------------------------------
+
+message AskRequest {
+  string user_id    = 1;
+  string session_id = 2;  // empty = server issues a fresh UUID and echoes it back in the first AskEvent
+  string question   = 3;
+
+  // Optional retrieval tuning.
+  string strategy   = 4;  // "graph_hybrid" (default) | "semantic" | "keyword" | "hybrid" | "graph" | "graph_cot" | "graph_constrained" | "summaries" | "rag_completion" | "temporal"
+  uint32 limit      = 5;  // default 8
+}
+
+// Stream of events the client renders as they arrive.
+// `one_of` pattern so the client can match on payload type.
+message AskEvent {
+  oneof payload {
+    AskSessionBound      session_bound     = 1;  // first event, echoes the (possibly server-issued) session_id
+    AskToolCall          tool_call         = 2;  // tool invoked (name + short arg summary) for progress UI
+    AskPartialAnswer     partial_answer    = 3;  // streaming text chunk, if the backend supports it
+    AskFinal             final_answer      = 4;  // terminal event: full answer + citations + grounding signals
+    AskError             error             = 5;  // non-retryable error, terminal
+  }
+}
+
+message AskSessionBound {
+  string session_id = 1;
+}
+
+message AskToolCall {
+  string tool_name   = 1;
+  string args_summary = 2;  // short human-readable, e.g. 'search_sections(20 ids)'; full args not echoed to client
+}
+
+message AskPartialAnswer {
+  string text_delta = 1;
+}
+
+message AskFinal {
+  string answer       = 1;
+  repeated Citation citations = 2;
+  double confidence   = 3;   // 0.0..=1.0
+  bool   is_grounded  = 4;
+  uint32 elapsed_ms   = 5;
+  string strategy     = 6;
+  optional CoverageReport coverage = 7;  // populated only for list-all / exhaustive flows
+}
+
+message Citation {
+  uint32 index          = 1;  // 1-based display index
+  string chunk_id       = 2;  // stable UUID (see crates/agent synthesis.rs)
+  string content_snippet = 3;
+  string source         = 4;  // "cli", "brave", etc.
+  double score          = 5;
+}
+
+message CoverageReport {
+  uint32 expected               = 1;
+  uint32 fetched                = 2;
+  repeated string missing_section_ids = 3;
+}
+
+message AskError {
+  string code    = 1;  // machine code: 'invalid_user_id' | 'session_not_found' | 'llm_error' | ...
+  string message = 2;  // human-readable
+}
+
+// -----------------------------------------------------------------------------
+// Ingest — client-streaming upload of PDF bytes.
+// -----------------------------------------------------------------------------
+
+message IngestChunk {
+  oneof payload {
+    IngestHeader header = 1;  // first message; defines user_id + filename + content_type
+    bytes        data   = 2;  // subsequent messages; raw bytes
+  }
+}
+
+message IngestHeader {
+  string user_id      = 1;
+  string source       = 2;  // filename, e.g. "segmentare.pdf"
+  string content_type = 3;  // e.g. "application/pdf"
+}
+
+message IngestReply {
+  string document_id   = 1;
+  string sha256        = 2;
+  string ingest_status = 3;  // usually 'complete'; 'partial_failure' for recoverable, 'failed' for terminal
+  string minio_object_key = 4;
+  uint32 n_pages       = 5;
+  uint32 n_chunks      = 6;
+  uint32 latency_ms    = 7;
+}
+
+// -----------------------------------------------------------------------------
+// Per-session document activation (which of a user's docs participate in a
+// conversation).
+// -----------------------------------------------------------------------------
+
+message ActivateDocsRequest {
+  string user_id              = 1;
+  string session_id           = 2;
+  repeated string document_ids = 3;
+}
+
+message ActivateDocsResponse {
+  uint32 activated_count = 1;
+  repeated string already_active_ids = 2;
+}
+
+message DeactivateDocsRequest {
+  string user_id              = 1;
+  string session_id           = 2;
+  repeated string document_ids = 3;
+}
+
+message DeactivateDocsResponse {
+  uint32 deactivated_count = 1;
+}
+
+message DeleteDocumentResponse {
+  string document_id     = 1;
+  uint32 removed_chunks  = 2;
+  uint32 removed_sections = 3;
+  bool   minio_deleted   = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Service
+// -----------------------------------------------------------------------------
+
+service Agent {
+  // Query path (streaming).
+  rpc Ask(AskRequest) returns (stream AskEvent);
+
+  // Ingest path (client-streaming upload).
+  rpc Ingest(stream IngestChunk) returns (IngestReply);
+
+  // Library reads.
+  rpc ListDocuments(UserRef) returns (DocumentList);
+  rpc ListSessions(UserRef) returns (SessionList);
+  rpc SessionHistory(SessionRef) returns (MessageList);
+
+  // Per-session activation.
+  rpc ActivateDocs(ActivateDocsRequest) returns (ActivateDocsResponse);
+  rpc DeactivateDocs(DeactivateDocsRequest) returns (DeactivateDocsResponse);
+
+  // Destructive (saga with idempotent compensations).
+  rpc DeleteDocument(DocRef) returns (DeleteDocumentResponse);
+}

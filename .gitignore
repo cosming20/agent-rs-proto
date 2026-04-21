@@ -1,0 +1,18 @@
+# This repo ships only .proto sources. Per-consumer generated code lives
+# under the consumer's target/ or node_modules, never in this tree.
+
+# Build artefacts (defensive — no build system runs here).
+/target
+/dist
+/out
+/gen
+
+# Editor / OS.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Tool caches.
+.buf/

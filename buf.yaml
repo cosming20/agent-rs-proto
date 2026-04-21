@@ -1,0 +1,17 @@
+# buf.build configuration. Consumers run `buf lint` / `buf breaking` from
+# their repo with this file as the reference. Everything is protobuf-native;
+# no Rust / Python codegen is emitted from this repo — each consumer
+# invokes tonic-build / grpc-tools / connect-es / ... on their side.
+
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Allow package names with versioned suffix (.v1).
+    - PACKAGE_VERSION_SUFFIX
+breaking:
+  use:
+    - FILE
