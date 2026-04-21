@@ -4,6 +4,26 @@ Shared gRPC contract for the [agent-rs](https://github.com/cosming20/agent-rs) p
 
 **This repository ships only `.proto` source files.** No Rust / TypeScript / Python generated code is checked in — every consumer compiles from the `.proto` files using its own toolchain (`tonic-build`, `connect-es`, `grpc-tools`, etc.).
 
+## Architecture (2026-04-21 stateless pivot)
+
+Agent-rs is fully stateless about conversations. All chat state lives in
+agent-rs-web's Postgres and is replayed inline with every Ask request.
+Documents are addressed end-to-end by their MinIO object key; indexing is
+decoupled from Ask via a RabbitMQ queue consumed by the IndexerWorker.
+
+**Surface:**
+
+| RPC | Shape | Purpose |
+|------|-------|---------|
+| `Ask` | server-streaming | Replay history + docs → stream tool calls / partial answers / final |
+| `EnqueueIndex` | unary | Publish a newly-uploaded MinIO key to the indexing queue |
+| `GetDocumentStatus` | unary | Poll indexing state machine (pending/indexing/complete/failed) |
+| `DeleteDocument` | unary | Purge Qdrant + Neo4j + index-state row for a key |
+
+The web app uploads bytes DIRECTLY to MinIO (its own S3 credentials) and
+only invokes this gRPC surface for control-plane coordination.
+
+
 ## Layout
 
 ```

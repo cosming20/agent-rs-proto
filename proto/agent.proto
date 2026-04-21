@@ -7,11 +7,32 @@ syntax = "proto3";
 //   - github.com/cosming20/agent-rs         (service implementation, tonic server)
 //   - github.com/cosming20/agent-rs-web     (leptos+axum frontend, tonic client)
 //
+// Design (2026-04-21 stateless pivot):
+//
+//   * Agent-rs is fully stateless about sessions. All conversation history
+//     lives in agent-rs-web's Postgres and is replayed to the agent inline
+//     with every Ask request. There are no sessions / chat_messages /
+//     session_active_documents tables on the agent side.
+//
+//   * Documents are addressed by their MinIO object key everywhere in this
+//     contract (`users/{user_id_simple}/docs/{uuid}.{ext}`). The agent
+//     maintains an internal `document_index_state` registry mapping
+//     `minio_object_key -> {pending, indexing, complete, failed}`; web polls
+//     GetDocumentStatus to hydrate its own `ingested_documents.ingest_status`.
+//
+//   * Indexing is decoupled from Ask via RabbitMQ. Web uploads bytes
+//     directly to MinIO, then calls EnqueueIndex; the IndexerWorker on
+//     the agent side consumes the queue and runs Docling + chunking +
+//     embed + Qdrant/Neo4j upserts. If Ask arrives before the worker has
+//     finished indexing a key referenced in `active_document_keys`, the
+//     agent streams AskIndexingWait events until the index is ready, then
+//     proceeds with retrieval.
+//
 // Versioning rules:
-//   - Fields must only be ADDED; never renumbered, retyped, or removed.
-//   - Reserved numbers: see `reserved` statements in individual messages.
-//   - New RPCs append to the `Agent` service.
-//   - Breaking changes go into `agent.v2.proto` (not in this release).
+//   * Fields must only be ADDED; never renumbered, retyped, or removed.
+//   * Reserved numbers: see `reserved` statements in individual messages.
+//   * New RPCs append to the `Agent` service.
+//   * Breaking changes go into `agent.v2.proto` (not in this release).
 
 package agent.v1;
 
@@ -26,102 +47,75 @@ message UserRef {
   string user_id = 1;
 }
 
-// Conversation identifier (UUID v4 string form). Empty string on AskRequest /
-// SessionHistory asks the server to issue a fresh session_id.
-message SessionRef {
-  string user_id    = 1;
-  string session_id = 2;
-}
-
-// Document identifier (UUID v5, derived server-side from
-// `user_id|sha256`). Opaque to clients — treat as a bytestring.
-message DocRef {
-  string user_id     = 1;
-  string document_id = 2;
+// A single turn in a conversation, replayed inline with every Ask request.
+// No authorship timestamps — the agent never persists these; they exist
+// only for the lifetime of the request that carries them.
+message ChatTurn {
+  string role    = 1;  // "user" | "assistant"
+  string content = 2;
 }
 
 // -----------------------------------------------------------------------------
-// Documents
+// Ask (query) — server-streaming.
 // -----------------------------------------------------------------------------
-
-message Document {
-  string document_id       = 1;
-  string user_id           = 2;
-  string source            = 3;   // original filename
-  string title             = 4;   // Docling-extracted title (may be empty)
-  string ingest_status     = 5;   // 'in_progress' | 'complete' | 'partial_failure' | 'failed' | 'deleting'
-  uint32 n_pages           = 6;
-  uint32 n_chunks          = 7;
-  string minio_object_key  = 8;   // "users/{u}/docs/{d}.{ext}", opaque to clients
-  string started_at        = 9;   // RFC 3339 UTC
-  string completed_at      = 10;  // RFC 3339 UTC, empty when still in progress
-}
-
-message DocumentList {
-  repeated Document documents = 1;
-}
-
-// -----------------------------------------------------------------------------
-// Sessions + chat history
-// -----------------------------------------------------------------------------
-
-message Session {
-  string session_id  = 1;
-  string user_id     = 2;
-  string created_at  = 3;  // RFC 3339
-  string updated_at  = 4;
-  uint32 message_count = 5;
-}
-
-message SessionList {
-  repeated Session sessions = 1;
-}
-
-message ChatMessage {
-  string id         = 1;
-  string session_id = 2;
-  string user_id    = 3;
-  string role       = 4;  // "user" | "assistant" | "system"
-  string content    = 5;
-  string created_at = 6;  // RFC 3339
-}
-
-message MessageList {
-  repeated ChatMessage messages = 1;
-}
-
-// -----------------------------------------------------------------------------
-// Ask (query) — server-streaming so the client can render progress.
-// -----------------------------------------------------------------------------
+//
+// Flow:
+//   1. Client sends AskRequest with history + active/history document keys.
+//   2. For each `active_document_keys` entry whose state is not yet
+//      `complete`, the server emits AskIndexingWait events while it waits
+//      for the IndexerWorker to finish; the event repeats every ~500ms so
+//      the UI can keep a spinner alive.
+//   3. Once all active keys are indexed, the server runs retrieval over the
+//      union `active ∪ history` and streams AskToolCall (progress) +
+//      optional AskPartialAnswer chunks.
+//   4. Terminal event is AskFinal (success) or AskError (fatal).
+//
+// Clients MUST ignore event variants they don't recognize (forward compat).
 
 message AskRequest {
-  string user_id    = 1;
-  string session_id = 2;  // empty = server issues a fresh UUID and echoes it back in the first AskEvent
-  string question   = 3;
+  string user_id = 1;
+  string query   = 2;
+
+  // Prior conversation turns, oldest-first. Empty = fresh conversation.
+  repeated ChatTurn history = 3;
+
+  // MinIO keys referenced in the CURRENT turn. These are the ones the
+  // agent may need to index on-demand if they're not yet in Qdrant/Neo4j.
+  repeated string active_document_keys = 4;
+
+  // MinIO keys previously referenced in this conversation. Retrieval
+  // searches the UNION (active ∪ history); the split exists for UX/lineage
+  // tracking on the web side, not for retrieval policy.
+  repeated string history_document_keys = 5;
+
+  // Optional client-provided correlation UUID for log/trace linking. Has
+  // NO authorization meaning — the agent treats it as an opaque string.
+  string trace_id = 6;
 
   // Optional retrieval tuning.
-  string strategy   = 4;  // "graph_hybrid" (default) | "semantic" | "keyword" | "hybrid" | "graph" | "graph_cot" | "graph_constrained" | "summaries" | "rag_completion" | "temporal"
-  uint32 limit      = 5;  // default 8
+  string strategy = 7;  // "graph_hybrid" (default) | "semantic" | "keyword" | "hybrid" | "graph" | "graph_cot" | "graph_constrained" | "summaries" | "rag_completion" | "temporal"
+  uint32 limit    = 8;  // default 8
 }
 
 // Stream of events the client renders as they arrive.
-// `one_of` pattern so the client can match on payload type.
 message AskEvent {
   oneof payload {
-    AskSessionBound      session_bound     = 1;  // first event, echoes the (possibly server-issued) session_id
-    AskToolCall          tool_call         = 2;  // tool invoked (name + short arg summary) for progress UI
-    AskPartialAnswer     partial_answer    = 3;  // streaming text chunk, if the backend supports it
-    AskFinal             final_answer      = 4;  // terminal event: full answer + citations + grounding signals
-    AskError             error             = 5;  // non-retryable error, terminal
+    AskIndexingWait  indexing_wait  = 1;  // repeated while waiting on a not-yet-complete active key
+    AskToolCall      tool_call      = 2;  // tool invoked for progress UI
+    AskPartialAnswer partial_answer = 3;  // streaming text chunk (optional, backend-dependent)
+    AskFinal         final          = 4;  // terminal success event
+    AskError         error          = 5;  // terminal error event
   }
 }
 
-message AskSessionBound {
-  string session_id = 1;
+message AskIndexingWait {
+  string minio_object_key = 1;
+  string state            = 2;  // "pending" | "indexing" | "failed"
+  string message          = 3;  // optional human-readable hint
 }
 
 message AskToolCall {
-  string tool_name   = 1;
+  string tool_name    = 1;
   string args_summary = 2;  // short human-readable, e.g. 'search_sections(20 ids)'; full args not echoed to client
 }
 
@@ -130,92 +124,88 @@ message AskPartialAnswer {
 }
 
 message AskFinal {
-  string answer       = 1;
-  repeated Citation citations = 2;
-  double confidence   = 3;   // 0.0..=1.0
-  bool   is_grounded  = 4;
-  uint32 elapsed_ms   = 5;
-  string strategy     = 6;
+  string answer                = 1;
+  repeated Citation citations  = 2;
+  double confidence            = 3;   // 0.0..=1.0
+  bool   is_grounded           = 4;
+  uint32 elapsed_ms            = 5;
+  string strategy              = 6;
   optional CoverageReport coverage = 7;  // populated only for list-all / exhaustive flows
 }
 
 message Citation {
-  uint32 index          = 1;  // 1-based display index
-  string chunk_id       = 2;  // stable UUID (see crates/agent synthesis.rs)
-  string content_snippet = 3;
-  string source         = 4;  // "cli", "brave", etc.
-  double score          = 5;
+  uint32 index            = 1;  // 1-based display index
+  string chunk_id         = 2;  // stable UUID
+  string content_snippet  = 3;
+  string minio_object_key = 4;  // which source doc this came from
+  string section_path     = 5;  // human-readable, e.g. "5.1.2 / Region growing"
+  double score            = 6;
 }
 
 message CoverageReport {
-  uint32 expected               = 1;
-  uint32 fetched                = 2;
-  repeated string missing_section_ids = 3;
+  uint32 expected                      = 1;
+  uint32 fetched                       = 2;
+  repeated string missing_section_ids  = 3;
 }
 
 message AskError {
-  string code    = 1;  // machine code: 'invalid_user_id' | 'session_not_found' | 'llm_error' | ...
+  string code    = 1;  // "invalid_user_id" | "index_failed" | "llm_error" | ...
   string message = 2;  // human-readable
 }
 
 // -----------------------------------------------------------------------------
-// Ingest — client-streaming upload of PDF bytes.
+// Indexing control plane
 // -----------------------------------------------------------------------------
+//
+// The web app uploads bytes DIRECTLY to MinIO (via its own S3 credentials),
+// then calls EnqueueIndex to hand off the key for chunking + embedding.
+// The RPC returns immediately after publishing to RabbitMQ; the actual work
+// happens in the IndexerWorker consumer.
+//
+// To monitor progress, clients poll GetDocumentStatus until state becomes
+// `complete` (or `failed` — inspect `error_message`). Ask requests that
+// carry not-yet-complete keys in `active_document_keys` will surface the
+// same state via AskIndexingWait events.
 
-message IngestChunk {
-  oneof payload {
-    IngestHeader header = 1;  // first message; defines user_id + filename + content_type
-    bytes        data   = 2;  // subsequent messages; raw bytes
-  }
+message EnqueueIndexRequest {
+  string user_id          = 1;
+  string minio_object_key = 2;
 }
 
-message IngestHeader {
-  string user_id      = 1;
-  string source       = 2;  // filename, e.g. "segmentare.pdf"
-  string content_type = 3;  // e.g. "application/pdf"
+message EnqueueIndexResponse {
+  string state  = 1;  // "queued" | "already_indexed" | "already_queued"
+  string job_id = 2;  // opaque correlation id for logs (may be empty)
 }
 
-message IngestReply {
-  string document_id   = 1;
-  string sha256        = 2;
-  string ingest_status = 3;  // usually 'complete'; 'partial_failure' for recoverable, 'failed' for terminal
-  string minio_object_key = 4;
-  uint32 n_pages       = 5;
-  uint32 n_chunks      = 6;
-  uint32 latency_ms    = 7;
+message GetDocumentStatusRequest {
+  string user_id          = 1;
+  string minio_object_key = 2;
+}
+
+message GetDocumentStatusResponse {
+  string state          = 1;  // "pending" | "indexing" | "complete" | "failed" | "not_found"
+  string sha256         = 2;  // lowercase hex; empty while state != "complete"
+  uint32 n_pages        = 3;
+  uint32 n_chunks       = 4;
+  string error_message  = 5;  // non-empty only when state == "failed"
 }
 
 // -----------------------------------------------------------------------------
-// Per-session document activation (which of a user's docs participate in a
-// conversation).
+// Destructive (saga with idempotent compensations across Qdrant + Neo4j)
 // -----------------------------------------------------------------------------
+//
+// The web app is responsible for removing the MinIO object itself (it
+// wrote it; it owns the blob lifecycle). DeleteDocument only purges the
+// agent-owned indices and the document_index_state row.
 
-message ActivateDocsRequest {
-  string user_id              = 1;
-  string session_id           = 2;
-  repeated string document_ids = 3;
-}
-
-message ActivateDocsResponse {
-  uint32 activated_count = 1;
-  repeated string already_active_ids = 2;
-}
-
-message DeactivateDocsRequest {
-  string user_id              = 1;
-  string session_id           = 2;
-  repeated string document_ids = 3;
-}
-
-message DeactivateDocsResponse {
-  uint32 deactivated_count = 1;
+message DeleteDocumentRequest {
+  string user_id          = 1;
+  string minio_object_key = 2;
 }
 
 message DeleteDocumentResponse {
-  string document_id     = 1;
-  uint32 removed_chunks  = 2;
-  uint32 removed_sections = 3;
-  bool   minio_deleted   = 4;
+  uint32 removed_chunks   = 1;
+  uint32 removed_sections = 2;
 }
 
 // -----------------------------------------------------------------------------
@@ -223,21 +213,15 @@ message DeleteDocumentResponse {
 // -----------------------------------------------------------------------------
 
 service Agent {
-  // Query path (streaming).
+  // Query path (server-streaming). See AskRequest / AskEvent above.
   rpc Ask(AskRequest) returns (stream AskEvent);
 
-  // Ingest path (client-streaming upload).
-  rpc Ingest(stream IngestChunk) returns (IngestReply);
+  // Indexing control plane (both RPCs are unary; work happens async on
+  // the IndexerWorker consumer of the RabbitMQ queue).
+  rpc EnqueueIndex(EnqueueIndexRequest) returns (EnqueueIndexResponse);
+  rpc GetDocumentStatus(GetDocumentStatusRequest) returns (GetDocumentStatusResponse);
 
-  // Library reads.
-  rpc ListDocuments(UserRef) returns (DocumentList);
-  rpc ListSessions(UserRef) returns (SessionList);
-  rpc SessionHistory(SessionRef) returns (MessageList);
-
-  // Per-session activation.
-  rpc ActivateDocs(ActivateDocsRequest) returns (ActivateDocsResponse);
-  rpc DeactivateDocs(DeactivateDocsRequest) returns (DeactivateDocsResponse);
-
-  // Destructive (saga with idempotent compensations).
-  rpc DeleteDocument(DocRef) returns (DeleteDocumentResponse);
+  // Destructive — purges the agent-owned indices for a document. Web
+  // removes the underlying MinIO object separately.
+  rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
 }
