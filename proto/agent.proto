@@ -66,9 +66,12 @@ message ChatTurn {
 //      for the IndexerWorker to finish; the event repeats every ~500ms so
 //      the UI can keep a spinner alive.
 //   3. Once all active keys are indexed, the server runs retrieval over the
-//      union `active ∪ history` and streams AskToolCall (progress) +
-//      optional AskPartialAnswer chunks.
-//   4. Terminal event is AskFinal (success) or AskError (fatal).
+//      union `active ∪ history`, runs the multi-turn agent (no streaming
+//      during tool calls), then dispatches the dedicated SynthesisAgent
+//      whose streamed text-deltas surface as AskPartialAnswer events.
+//   4. Terminal event is AskFinal (success) or AskError (fatal). A
+//      BudgetSnapshot event is emitted once after Final so clients can
+//      render per-request cost without polling a sidechannel.
 //
 // Clients MUST ignore event variants they don't recognize (forward compat).
 
@@ -100,11 +103,12 @@ message AskRequest {
 // Stream of events the client renders as they arrive.
 message AskEvent {
   oneof payload {
-    AskIndexingWait  indexing_wait  = 1;  // repeated while waiting on a not-yet-complete active key
-    AskToolCall      tool_call      = 2;  // tool invoked for progress UI
-    AskPartialAnswer partial_answer = 3;  // streaming text chunk (optional, backend-dependent)
-    AskFinal         final          = 4;  // terminal success event
-    AskError         error          = 5;  // terminal error event
+    AskIndexingWait  indexing_wait   = 1;  // repeated while waiting on a not-yet-complete active key
+    AskToolCall      tool_call       = 2;  // tool invoked for progress UI
+    AskPartialAnswer partial_answer  = 3;  // streaming text chunk (emitted by SynthesisAgent)
+    AskFinal         final           = 4;  // terminal success event
+    AskError         error           = 5;  // terminal error event
+    BudgetSnapshot   budget_snapshot = 6;  // emitted once at end-of-stream after Final
   }
 }
 
@@ -121,6 +125,22 @@ message AskToolCall {
 
 message AskPartialAnswer {
   string text_delta = 1;
+}
+
+// Streaming token-budget snapshot, emitted once at end-of-stream so
+// clients can render per-request cost without polling a sidechannel.
+// Fields mirror `agent_rs_observability::budget::BudgetSnapshot` —
+// token/cost totals are the SUM across every LLM call dispatched
+// during the request (agent runner + synthesis stream).
+message BudgetSnapshot {
+  // Sum of prompt + completion tokens across all recorded calls.
+  uint64 total_tokens         = 1;
+  // Subset of prompt tokens billed at the cached-input rate.
+  uint64 cached_input_tokens  = 2;
+  // Estimated USD cost across all calls.
+  double cost_usd             = 3;
+  // Number of LLM calls aggregated.
+  uint64 call_count           = 4;
 }
 
 message AskFinal {
