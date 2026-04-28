@@ -124,10 +124,17 @@ message AskPartialAnswer {
 }
 
 message AskFinal {
+  // Field 4 (`bool is_grounded`) was removed in the synthesizer-streams
+  // refactor: the LLM-based grounding verifier was deleted and the agent
+  // no longer emits a per-answer grounded flag. `confidence` (field 3)
+  // now carries the deterministic answer-vs-evidence token-overlap
+  // signal; downstream consumers should branch on that instead.
+  reserved 4;
+  reserved "is_grounded";
+
   string answer                = 1;
   repeated Citation citations  = 2;
-  double confidence            = 3;   // 0.0..=1.0
-  bool   is_grounded           = 4;
+  double confidence            = 3;   // 0.0..=1.0 — heuristic answer/evidence token-overlap
   uint32 elapsed_ms            = 5;
   string strategy              = 6;
   optional CoverageReport coverage = 7;  // populated only for list-all / exhaustive flows
